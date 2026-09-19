@@ -7,8 +7,12 @@ identity FDR-1 was derived from -- stationarity of ``0.5|w|^2`` -- has no
 solution. ``rho`` then goes negative and stays there.
 
 This is the single most likely thing a new user hits, because the default
-PyTorch recipe (cross-entropy, no weight decay) is exactly that case. These
-tests pin the behaviour: report it, name it, and say what to do about it.
+PyTorch recipe (cross-entropy, no weight decay) is exactly that case.
+
+The converse matters as much: a negative ``rho`` is NOT by itself evidence of
+a growing norm. In near-separable problems ``rho`` is noisy enough to go
+negative while ``|w|`` is perfectly stationary. The verdict on the norm is
+therefore taken from ``|w|^2`` directly, and these tests pin both directions.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import warnings
 import numpy as np
 import pytest
 
-from physfdt import FDRAccumulator, FDRConfig, NumpyFDRMonitor
+from physfdt import FDRAccumulator, FDRConfig, NonStationaryWarning, NumpyFDRMonitor
 
 
 def separable_logistic(weight_decay, steps=40_000, eta=0.05, seed=0,
@@ -28,7 +32,14 @@ def separable_logistic(weight_decay, steps=40_000, eta=0.05, seed=0,
     w_true = rng.standard_normal(d)
     w_true /= np.linalg.norm(w_true)
     X = rng.standard_normal((n, d))
-    margin = X @ w_true
+    # w_true is a unit vector and X is standard-normal, so X @ w_true cannot
+    # genuinely overflow float64. Some BLAS backends (observed: numpy 2.3 +
+    # Apple Accelerate) raise spurious divide-by-zero/overflow/invalid-value
+    # RuntimeWarnings from matmul on perfectly finite input -- an artifact of
+    # the backend, not of this data. errstate suppresses it at the source
+    # rather than letting it pollute anyone's warnings.catch_warnings().
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        margin = X @ w_true
     keep = np.abs(margin) > 0.3          # a clean separation gap
     X, margin = X[keep], margin[keep]
     y = (margin > 0).astype(float)
@@ -57,8 +68,10 @@ def test_no_weight_decay_gives_negative_rho_and_growing_norm():
     rho, norm, states = separable_logistic(weight_decay=0.0)
     assert norm[-1] > 5 * norm[0], f"|w| {norm[0]:.3f} -> {norm[-1]:.3f}"
     assert rho[-1] < 0, f"final rho = {rho[-1]}"
-    assert states[-1].regime == "norm_growing_fast"
-    assert not states[-1].equilibrated
+    assert states[-1].regime == "norm_growing"
+    assert states[-1].norm_trend > 0
+    assert states[-1].nonstationary_run > 1000
+    assert not any(s.equilibrated for s in states)
 
 
 def test_weight_decay_restores_stationarity():
@@ -67,7 +80,10 @@ def test_weight_decay_restores_stationarity():
     tail = float(np.mean(rho[-5000:]))
     assert abs(tail - 1.0) < 0.25, f"mean rho = {tail}"
     assert norm[-1] < 5.0, f"|w| ended at {norm[-1]:.3f}"
-    assert states[-1].regime != "norm_growing_fast"
+    # The norm verdict must say "not drifting", even though rho is noisy here.
+    late = states[-5000:]
+    drifting = sum(s.regime in ("norm_growing", "norm_shrinking") for s in late)
+    assert drifting / len(late) < 0.2, f"{drifting}/{len(late)} late steps flagged"
 
 
 def test_logistic_is_a_hard_case_and_says_so():
@@ -116,7 +132,11 @@ def test_warning_fires_once_and_is_actionable():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         separable_logistic(weight_decay=0.0, steps=5000, config=cfg)
-    msgs = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    # Filter on NonStationaryWarning specifically, not the bare RuntimeWarning
+    # category: RuntimeWarning is also what NumPy itself uses for
+    # floating-point warnings, so a blanket filter can catch noise that has
+    # nothing to do with physfdt (see the errstate note above).
+    msgs = [w for w in caught if issubclass(w.category, NonStationaryWarning)]
     assert len(msgs) == 1, f"expected exactly one warning, got {len(msgs)}"
     text = str(msgs[0].message).lower()
     assert "no stationary state" in text
@@ -129,7 +149,7 @@ def test_warning_can_be_silenced():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         separable_logistic(weight_decay=0.0, steps=5000, config=cfg)
-    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert not [w for w in caught if issubclass(w.category, NonStationaryWarning)]
 
 
 # --------------------------------------------------------------------------
@@ -138,28 +158,127 @@ def test_warning_can_be_silenced():
 @pytest.mark.parametrize(
     "lhs,rhs,want",
     [
-        (2.0, 2.0, "equilibrated"),        # rho = 1
-        (10.0, 2.0, "norm_shrinking"),     # rho = 5
-        (1.0, 2.0, "norm_growing"),        # rho = 0.5
-        (-4.0, 2.0, "norm_growing_fast"),  # rho = -2
+        (2.0, 2.0, "equilibrated"),     # rho = 1
+        (10.0, 2.0, "norm_shrinking"),  # rho = 5
+        (1.0, 2.0, "norm_growing"),     # rho = 0.5
+        (-4.0, 2.0, "norm_growing"),    # rho = -2
     ],
 )
-def test_regime_labels(lhs, rhs, want):
+def test_regime_fallback_labels_without_norm(lhs, rhs, want):
+    """With no |w|^2 supplied, labels fall back to the sign of 1 - rho."""
     acc = FDRAccumulator(FDRConfig(half_life=2, warn_nonstationary=False))
     for _ in range(50):
         st = acc.observe(lhs, rhs)
     assert st.regime == want, f"rho={st.rho:.3f} labelled {st.regime}"
 
 
-def test_nonstationary_run_resets_when_rho_turns_positive():
-    acc = FDRAccumulator(FDRConfig(half_life=2, warn_nonstationary=False))
-    for _ in range(30):
-        st = acc.observe(-4.0, 2.0)
-    assert st.nonstationary_run == 30
-    for _ in range(30):
-        st = acc.observe(2.0, 2.0)
+def test_negative_rho_with_stationary_norm_is_not_called_growing():
+    """The bug behind the quickstart log: rho < 0 while |w| is flat must not be
+    reported as a growing norm."""
+    acc = FDRAccumulator(FDRConfig(half_life=5, warn_nonstationary=False))
+    rng = np.random.default_rng(0)
+    for _ in range(3000):
+        st = acc.observe(-4.0, 2.0, norm2=10.0 + 0.1 * rng.standard_normal())
+    assert st.rho < 0
+    assert st.regime == "stationary_noisy"
     assert st.nonstationary_run == 0
-    assert st.regime == "equilibrated"
+    assert not st.equilibrated
+
+
+def test_growing_norm_is_detected_from_norm_not_rho():
+    """And the converse: a trending |w|^2 is flagged even when rho sits at 1.
+
+    The trend window spans `norm_window_factor * half_life` measured steps
+    (20 here) -- a short, fast-reacting window by design. For a steady linear
+    drift, the relative signal visible *within* that window shrinks like
+    ~window / (2 * elapsed) the longer the run has already gone on, since the
+    baseline itself has grown too. So this must be checked while still close
+    to the window filling, not arbitrarily late in a long run: at t=3000 the
+    same drift that's obvious over the run's full history is only ~0.3%
+    within the last 20 steps -- correctly below norm_rel_tol, and invisible
+    to a window that short by construction, not a bug.
+    """
+    acc = FDRAccumulator(FDRConfig(half_life=5, warn_nonstationary=False))
+    for t in range(100):
+        st = acc.observe(2.0, 2.0, norm2=1.0 + 0.01 * t)
+    assert abs(st.rho - 1.0) < 1e-9
+    assert st.regime == "norm_growing"
+    assert not st.equilibrated
+
+
+def test_lr_decay_with_weight_decay_is_not_flagged_as_growing():
+    """The quickstart log: after an LR halving with weight decay present, rho
+    went negative and the old code said 'no stationary state; add weight
+    decay'. With weight decay present |w| stays put after the decay, so the
+    norm must never be judged to be growing -- however negative rho gets.
+
+    (The opening phase, from a small initialisation, *is* genuine growth and
+    is allowed to warn; this test is about what happens after the decay.)
+    """
+    cfg = FDRConfig(half_life=500, warn_nonstationary=False)
+    rng = np.random.default_rng(0)
+    d = 20
+    wt = rng.standard_normal(d)
+    wt /= np.linalg.norm(wt)
+    X = rng.standard_normal((3000, d))
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        m = X @ wt
+    keep = np.abs(m) > 0.3
+    X, m = X[keep], m[keep]
+    y = (m > 0).astype(float)
+    w = 0.1 * rng.standard_normal(d)
+    mon = NumpyFDRMonitor(cfg)
+    eta, wd = 0.05, 1e-2
+
+    def run(n):
+        nonlocal w
+        out = []
+        for _ in range(n):
+            i = rng.integers(0, len(X), 32)
+            p = 1.0 / (1.0 + np.exp(-np.clip(X[i] @ w, -60, 60)))
+            u = X[i].T @ (p - y[i]) / 32 + wd * w
+            out.append(mon.observe(w, u, eta))
+            w = w - eta * u
+        return out
+
+    run(40_000)
+    eta = 0.025
+    mon.reset()
+    after = run(40_000)
+
+    assert sum(s.rho < 0 for s in after) > 1000, "precondition: rho goes negative"
+    assert max(s.nonstationary_run for s in after) == 0
+    late = after[-20_000:]
+    assert sum(s.regime == "stationary_noisy" for s in late) / len(late) > 0.8
+    # rho is far too noisy here to certify equilibrium, and it must say so.
+    assert not late[-1].tol_is_achievable
+
+
+def test_patience_default_blocks_firing_mid_transient():
+    """The first log's premature decay: rho was still sliding down through the
+    band (1.43 -> 1.21 -> 1.08) when patience=50 let it fire. Default
+    patience is now half_life."""
+    assert FDRConfig(half_life=500).patience == 500
+    assert FDRConfig(half_life=500).min_steps == 500
+    # A rho that drifts linearly from 1.5 to 0.5 over 2000 steps spends ~400
+    # steps in the band [0.9, 1.1]; with patience = half_life = 500 it must not
+    # fire, even though the norm is supplied as flat.
+    acc = FDRAccumulator(FDRConfig(half_life=500, warn_nonstationary=False))
+    fired = False
+    for t in range(2000):
+        r = 1.5 - t / 2000
+        st = acc.observe(2.0 * r, 2.0, norm2=5.0)
+        fired |= st.equilibrated
+    assert not fired
+
+
+def test_config_rescaled_by_every():
+    cfg = FDRConfig(half_life=500).rescaled(20)
+    assert cfg.half_life == 25
+    assert cfg.patience == 25
+    assert cfg.min_steps == 25
+    assert cfg.nonstationary_patience == 100
+    assert FDRConfig(half_life=500).rescaled(1).half_life == 500
 
 
 def test_norm_drift_identity():

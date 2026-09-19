@@ -77,10 +77,9 @@ def main() -> None:
     ap.add_argument("--schedule", default="constant", choices=["constant", "fdr", "cosine"])
     ap.add_argument("--every", type=int, default=1, help="measure every N steps")
     ap.add_argument("--alpha-every", type=int, default=100, help="SVD is not cheap")
-    ap.add_argument("--half-life", type=int, default=500)
+    ap.add_argument("--half-life", type=int, default=500,
+                    help="in optimiser steps; patience and min_steps default to it")
     ap.add_argument("--tol", type=float, default=0.10)
-    ap.add_argument("--patience", type=int, default=50)
-    ap.add_argument("--min-steps", type=int, default=500)
     ap.add_argument("--out", default="fdr_trace.csv")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -102,10 +101,7 @@ def main() -> None:
     )
     criterion = nn.CrossEntropyLoss()
 
-    cfg = FDRConfig(
-        half_life=args.half_life, tol=args.tol,
-        patience=args.patience, min_steps=args.min_steps,
-    )
+    cfg = FDRConfig(half_life=args.half_life, tol=args.tol)
     monitor = FDRMonitor(opt, cfg, mode="delta", every=args.every)
     fdr_sched = FDREquilibriumLR(opt, monitor, factor=0.5, min_lr=1e-5)
     cos_sched = (
@@ -114,7 +110,8 @@ def main() -> None:
     )
 
     trace = TraceWriter(args.out,
-                        extra=["loss", "alpha", "r2", "ipr_max", "regime", "rho_std"])
+                        extra=["loss", "alpha", "r2", "ipr_max", "regime", "rho_std",
+                               "norm_trend"])
     print(f"device={device}  dataset={args.dataset}  schedule={args.schedule}  "
           f"weight_decay={args.weight_decay:g}")
     if args.weight_decay == 0.0:
@@ -151,14 +148,15 @@ def main() -> None:
             if state is not None:
                 trace.write(state, lr=lr_now, loss=loss.item(),
                             alpha=alpha, r2=r2, ipr_max=ipr_max,
-                            regime=state.regime, rho_std=state.rho_std)
+                            regime=state.regime, rho_std=state.rho_std,
+                            norm_trend=state.norm_trend)
 
             if step % 200 == 0 or fired:
                 rho = f"{state.rho:10.4f}" if state else " " * 10
                 a = f"{alpha:8.3f}" if alpha != "" else " " * 8
                 status = state.regime if state else ""
-                if state and state.regime == "norm_growing_fast":
-                    status += "   <- no stationary state; add weight decay"
+                if state and state.norm_trend == state.norm_trend:
+                    status += f"   |w|^2 {100 * state.norm_trend:+.2f}%/window"
                 if fired:
                     status = "LR DECAY"
                 print(f"{step:>7} {loss.item():>9.4f} {lr_now:>10.5f} {rho} {a}  {status}")
@@ -182,8 +180,19 @@ def main() -> None:
                       "'equilibrated' would be\n     decided by sampling noise. "
                       f"Raise --half-life (scatter falls as 1/sqrt) or --tol "
                       f"above {3 * last.rho_std:.3f}.")
-        if last.regime == "norm_growing_fast":
-            print("  !! rho < 0: no stationary state. See --weight-decay.")
+        if last.rho_std != last.rho_std:
+            print("noise floor of rho: not yet measurable (needs 20 half-lives "
+                  "since the last reset)")
+        if last.regime == "norm_growing":
+            if args.weight_decay == 0.0:
+                print("  !! |w| growing with weight_decay=0: no stationary state. "
+                      "See --weight-decay.")
+            else:
+                print("  !! |w| still growing: equilibrium norm not reached yet "
+                      "(common right after an LR decay). Train longer.")
+        elif last.regime == "stationary_noisy":
+            print("  |w| is stationary but rho is outside the band: rho too noisy "
+                  "at this half-life. Raise --half-life.")
     print(f"trace -> {args.out}")
     if fdr_sched.history:
         print("FDR-triggered decays (step, lr_before, rho):")

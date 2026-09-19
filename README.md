@@ -39,9 +39,9 @@ Define
 ρ  =  2⟨w · u⟩ / (η ⟨|u|²⟩)
 ```
 
-`ρ → 1` exactly when the weight norm has stopped drifting — the system has
-equilibrated at that η, and further steps at that η buy nothing. `physfdt`
-tracks `ρ` with exponentially smoothed numerator and denominator (a ratio of
+At stationarity `ρ = 1` exactly: the system has equilibrated at that η, and
+further steps at that η buy nothing. (The converse needs care — see *Reading ρ*
+below.) `physfdt` tracks `ρ` with exponentially smoothed numerator and denominator (a ratio of
 averages, never an average of ratios) and reports when it settles.
 
 For **plain SGD** (`u = g`) this is the fluctuation–dissipation relation of
@@ -57,43 +57,49 @@ established. `physfdt` warns rather than hides this.
 
 ## Reading ρ
 
-The same algebra gives an exact drift law:
+The same algebra gives an exact drift law, `E[Δ|w|²] = η²⟨|u|²⟩(1 − ρ)`. It
+is tempting to read the norm's behaviour off the sign of `1 − ρ`. **Don't.**
+ρ is a ratio whose denominator `η⟨|u|²⟩` can be tiny and dominated by a few
+samples; measured on near-separable logistic regression with weight decay, ρ
+was negative on 16,451 of 40,000 steps while `|w|` sat at 3.67 to three
+decimals. So `physfdt` takes the verdict on the norm from `|w|²` directly — a
+trend test over the last `4 × half_life` steps that must be both statistically
+significant (`norm_z`) and physically non-negligible (`norm_rel_tol`, 0.5%) —
+and uses ρ only for what it is good at: *given* a stationary norm, has the FDR
+balance been reached.
 
-```
-E[Δ|w|²] = η² ⟨|u|²⟩ (1 − ρ)
-```
+| `regime` | meaning |
+|---|---|
+| `norm_growing` / `norm_shrinking` | `|w|²` is trending. Not equilibrated, whatever ρ says. |
+| `equilibrated` | norm flat **and** `|ρ − 1| < tol` for `patience` steps |
+| `stationary_noisy` | norm flat but ρ outside the band — ρ is too noisy at this `half_life`; compare `rho_std` with `tol` |
+| `warming_up` | not enough history for a norm verdict yet |
 
-so the sign of `ρ − 1` says what the norm is doing. Every measurement carries a
-`regime` label:
+### If the norm keeps growing
 
-| ρ | `regime` | meaning |
-|---|---|---|
-| `< 0` | `norm_growing_fast` | `⟨w·u⟩ < 0` — the update points *away* from the origin. **No stationary state exists; FDR-1 does not apply.** |
-| `0 … 1−tol` | `norm_growing` | norm still growing, dissipation pulling back |
-| `≈ 1` | `equilibrated` | done at this η |
-| `> 1+tol` | `norm_shrinking` | the usual opening transient |
+Two different situations produce a sustained `norm_growing`, and they need
+opposite responses:
 
-### If ρ is negative and stays negative
-
-This is the most common first encounter, and it is the tool working, not
-failing. Cross-entropy on separable or interpolating data has **no stationary
-weight norm**: once the data is separated, max-margin dynamics drives
-`|w| → ∞` ([Soudry et al., JMLR 2018](https://jmlr.org/papers/v19/18-188.html)),
-so the observable `½|w|²` FDR-1 was derived from never settles.
+- **No weight decay, cross-entropy.** Once the data is separated, max-margin
+  dynamics drives `|w| → ∞`
+  ([Soudry et al., JMLR 2018](https://jmlr.org/papers/v19/18-188.html)). There
+  is **no stationary state**; FDR-1 never applies. Add weight decay.
+- **Weight decay present.** The equilibrium norm exists but has moved — for
+  instance after a learning-rate decay, or when starting from a small
+  initialisation. This is a transient. Train longer.
 
 Measured on logistic regression over separable data, 40k steps:
 
 | weight decay | \|w\| start → end | final ρ | |
 |---|---|---|---|
-| 0 | 0.46 → **11.07** | **−14294** | diverging |
+| 0 | 0.46 → **11.07** | **−14294** | diverging, no stationary state |
 | 1e-4 | 0.46 → 10.15 | −4614 | diverging |
 | 1e-3 | 0.46 → 6.90 | 0.39 | not yet settled |
-| **1e-2** | 0.46 → **3.67** | **1.07** | ρ → 1 |
-| **5e-2** | 0.46 → **2.07** | **1.02** | ρ → 1 |
+| **1e-2** | 0.46 → **3.67** | **1.07** | stationary |
+| **5e-2** | 0.46 → **2.07** | **1.02** | stationary |
 
-Add weight decay (or any confining term) and ρ becomes meaningful. `physfdt`
-raises a `RuntimeWarning` naming this once ρ has been negative for
-`nonstationary_patience` steps.
+`physfdt` raises a one-time `RuntimeWarning` naming both causes once the norm
+has grown for `nonstationary_patience` (default `4 × half_life`) steps.
 
 ### Check `tol` against the noise floor
 
@@ -201,8 +207,8 @@ to check them. Read them before you read the result.
 | | |
 |---|---|
 | `FDRConfig(half_life, tol, patience, min_steps)` | detector settings; defaults are self-consistent (see *Reading ρ*) |
-| `state.regime`, `state.rho_std`, `state.tol_is_achievable` | is this measurement meaningful? |
-| `FDRMonitor(optimizer, config, mode, every)` | torch monitor; `mode="delta"` (any optimiser) or `"grad"` (plain SGD, zero extra memory) |
+| `state.regime`, `state.norm_trend`, `state.rho_std`, `state.tol_is_achievable` | is this measurement meaningful? |
+| `FDRMonitor(optimizer, config, mode, every)` | torch monitor; `mode="delta"` (any optimiser) or `"grad"` (plain SGD, zero extra memory). Config timescales are in **optimiser** steps whatever `every` is. |
 | `FDREquilibriumLR(optimizer, monitor, factor, min_lr)` | decay on equilibrium |
 | `NumpyFDRMonitor(config)` | toy models and hand-written optimisers |
 | `spectral_report(W, method="mle"\|"window")` | `α`, its standard error, R², IPR |
@@ -255,7 +261,7 @@ Read this before putting a number in a paper.
 ## Tests
 
 ```bash
-pytest -q          # 47 tests
+pytest -q          # 51 tests (2 need torch)
 ```
 
 The physics tests are the ones that matter. `tests/test_validation_quadratic.py`

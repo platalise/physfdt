@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Four-arm intervention benchmark: does FDR-triggered decay actually save anything?
 
-    python examples/03_benchmark_arms.py --seeds 5 --target-loss 0.35
+    python examples/03_benchmark_arms.py --seeds 5
 
 This is the experiment that turns "physfdt measures equilibrium" into a claim
 anyone can check. It is deliberately hostile to its own hypothesis.
@@ -169,7 +169,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--steps", type=int, default=6000)
-    ap.add_argument("--target-loss", type=float, default=0.35)
+    ap.add_argument("--target-loss", type=float, default=0.45,
+                    help="must be reachable by the constant arm, or steps-to-"
+                         "target is undefined for the floor. With weight decay "
+                         "1e-2 the constant arm plateaus near 0.39.")
     ap.add_argument("--lr-grid", type=float, nargs="+",
                     default=[0.02, 0.05, 0.1, 0.2, 0.4, 0.8])
     ap.add_argument("--arms", nargs="+",
@@ -186,7 +189,12 @@ def main() -> None:
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg = FDRConfig(half_life=200, tol=0.05, patience=50, min_steps=300)
+    # Library defaults, in OPTIMISER steps. (0.2.0 hardcoded half_life=200,
+    # tol=0.05, patience=50, min_steps=300 here -- tol below the noise floor,
+    # and with every=20 those counts were read as measured steps, i.e. 20x
+    # longer. min_steps alone was 6,000 optimiser steps: the whole run. That is
+    # why the fdr arm never fired.)
+    cfg = FDRConfig()
 
     print(f"device={device}  arms={args.arms}  seeds={args.seeds}")
     print(f"tuning grid (identical for every arm): {args.lr_grid}\n")

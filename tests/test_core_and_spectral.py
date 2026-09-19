@@ -96,15 +96,21 @@ def _powerlaw_matrix(n=400, m=600, alpha=2.5, seed=0):
     rng = np.random.default_rng(seed)
     Q, _ = np.linalg.qr(rng.standard_normal((n, n)))
     # Clamp the inverse-CDF draw away from 1. Unclamped, a draw within float64
-    # eps of 1 sends lam to inf and the matmul below overflows -- which showed
-    # up as divide-by-zero/overflow RuntimeWarnings on some BLAS backends
-    # (observed on numpy 2.3 + Accelerate) but not others. The clamp keeps four
-    # decades of power-law range, which is ample for the fit.
+    # eps of 1 sends lam to inf. The clamp keeps four decades of power-law
+    # range, which is ample for the fit -- and it is enforced below, not just
+    # hoped for.
     u = np.clip(rng.uniform(size=n), 0.0, 1.0 - 1e-6)
     lam = (1.0 - u) ** (-1.0 / (alpha - 1.0))      # density ~ lam^-alpha
     assert np.isfinite(lam).all()
     R, _ = np.linalg.qr(rng.standard_normal((m, n)))
-    return Q @ np.diag(np.sqrt(lam)) @ R.T
+    # lam is finite (asserted above) and Q, R are orthonormal, so this product
+    # cannot genuinely overflow. Some BLAS backends (observed: numpy 2.3 +
+    # Apple Accelerate) raise spurious divide-by-zero/overflow/invalid-value
+    # RuntimeWarnings from matmul regardless -- a backend artifact, not a
+    # property of this data. Suppress at the source rather than let it leak
+    # into anyone's warnings.catch_warnings().
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        return Q @ np.diag(np.sqrt(lam)) @ R.T
 
 
 def test_esd_matches_eigenvalues_of_wwT():

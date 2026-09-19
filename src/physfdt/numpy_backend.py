@@ -65,7 +65,8 @@ class NumpyFDRMonitor:
 
     def observe(self, w: ArrayLike, u: ArrayLike, eta: float) -> FDRState:
         lhs, rhs = fdr_terms(w, u, eta)
-        return self.acc.observe(lhs, rhs)
+        wf = _flatten(w)
+        return self.acc.observe(lhs, rhs, norm2=float(np.dot(wf, wf)))
 
     def reset(self) -> None:
         """Clear history. Call after every learning-rate change."""

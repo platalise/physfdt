@@ -59,7 +59,9 @@ class FDRMonitor:
         ``"delta"`` or ``"grad"``. See module docstring.
     every:
         Measure once every ``every`` optimiser steps. Untouched steps cost
-        nothing.
+        nothing. Timescales in ``config`` are always in *optimiser* steps; the
+        monitor converts them internally, so changing ``every`` does not
+        silently stretch the detector's memory.
 
     Examples
     --------
@@ -93,7 +95,11 @@ class FDRMonitor:
             raise ValueError("every must be >= 1")
 
         self.optimizer = optimizer
-        self.acc = FDRAccumulator(config)
+        # Config timescales are in OPTIMISER steps. The accumulator only sees
+        # one step in `every`, so convert, otherwise half_life=500 with
+        # every=20 silently means 10,000 optimiser steps.
+        self.user_config = config or FDRConfig()
+        self.acc = FDRAccumulator(self.user_config.rescaled(every))
         self.mode = mode
         self.every = every
 
@@ -153,6 +159,7 @@ class FDRMonitor:
 
         lhs = 0.0
         rhs = 0.0
+        norm2 = 0.0
         with torch.no_grad():
             if self.mode == "delta":
                 if self._snapshot is None:
@@ -165,6 +172,7 @@ class FDRMonitor:
                     # u = -delta / eta
                     lhs += -2.0 * float(torch.sum(w0 * delta)) / eta
                     rhs += float(torch.sum(delta * delta)) / eta
+                    norm2 += float(torch.sum(w0 * w0))
                 self._snapshot = None
             else:  # grad mode: plain SGD, u = grad + wd * w
                 for group, p in self._params():
@@ -178,8 +186,9 @@ class FDRMonitor:
                         u = u.add(w, alpha=wd)
                     lhs += 2.0 * float(torch.sum(w * u))
                     rhs += eta * float(torch.sum(u * u))
+                    norm2 += float(torch.sum(w * w))
 
-        self.last = self.acc.observe(lhs, rhs)
+        self.last = self.acc.observe(lhs, rhs, norm2=norm2)
         return self.last
 
     # ------------------------------------------------------------------
@@ -201,7 +210,8 @@ class FDRMonitor:
 
     @property
     def config(self) -> FDRConfig:
-        return self.acc.config
+        """The config as you passed it, in optimiser steps."""
+        return self.user_config
 
 
 class _MeasureCtx:

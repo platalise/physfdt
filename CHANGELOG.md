@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.3.1
+
+Found by the user's own `pytest -q` on macOS: two tests that were green in
+this project's own sandbox failed there -- `test_warning_fires_once_and_is_actionable`
+got 4 warnings instead of 1, `test_warning_can_be_silenced` got 3 instead of
+0. The warning-firing logic itself was not the bug; the test's filter was.
+
+### `physfdt`'s own warning is now its own class
+
+`observe()` used to raise a plain `RuntimeWarning`. That category is also
+what NumPy itself uses for floating-point warnings (divide by zero, overflow,
+invalid value), including spurious ones a BLAS backend can raise on input
+that is perfectly finite -- observed on the user's machine (numpy + Apple
+Accelerate) from a plain `X @ w_true` matmul that cannot mathematically
+overflow. `warnings.catch_warnings()` filtered on the bare `RuntimeWarning`
+category therefore counted both: physfdt's one real warning plus three
+BLAS-backend artifacts, and the two tests above were checking exactly that
+count.
+
+* New `NonStationaryWarning(RuntimeWarning)`. `observe()` now raises this
+  instead of `RuntimeWarning` directly (still catchable as `RuntimeWarning`
+  for existing code, but filterable precisely).
+* The two tests now filter on `NonStationaryWarning`.
+* The test helpers' own matmuls (`separable_logistic`'s `X @ w_true`, the LR-decay
+  regression test's `X @ wt`, and `test_core_and_spectral.py`'s `_powerlaw_matrix`)
+  are now wrapped in `np.errstate(over="ignore", invalid="ignore", divide="ignore")`,
+  so the spurious BLAS warnings are suppressed at the source rather than left
+  to leak into whatever a test happens to be recording.
+* Correction to the 0.2.0 entry below: the fix credited there ("fixed a float
+  overflow in the power-law test fixture") clamped `lam`, which
+  `assert np.isfinite(lam).all()` already showed was never actually infinite.
+  The real source was the matmul itself, not `lam` -- which is why the same
+  warning resurfaced in this round at the same line. Fixed properly here.
+
+### The norm trend window ignored `half_life` below 50
+
+Fixing the test above meant finally installing real PyTorch in a sandbox that
+runs this suite (previously only reachable via the hand-written shim,
+`tests/test_torch_backend.py`'s own fallback for exactly this gap) and
+running `test_scheduler_decays_and_resets` for the first time. It failed:
+zero decays fired in 3 steps with `patience=1, min_steps=1` -- settings that
+should make equilibrium near-instant.
+
+Root cause: the trend test on `|w|^2` subsamples its lookback window to at
+most 200 points for bounded cost, via `stride = max(1, span // 200)` where
+`span = norm_window_factor * half_life`. Correct when `span >= 200`. But the
+window itself was hard-coded to hold exactly 200 points regardless of
+`stride`, so for `span < 200` (any `half_life` under 50 at the default
+`norm_window_factor=4`) the window still needed 200 raw measured steps to
+fill -- ten times `span` in this test's case (`half_life=5` -> `span=20`) --
+silently overriding the documented contract that the window looks back over
+`norm_window_factor * half_life` steps, and any `min_steps`/`patience` a user
+sets to react faster than that.
+
+* Window length is now `min(200, span // stride)`, matching the documented
+  span exactly in both regimes. Verified directly: with `half_life=5,
+  norm_window_factor=4`, equilibrium is now reachable at the 20th measured
+  step (previously the 200th), matching `span` on the nose.
+* Default config (`half_life=500`, `span=2000 >= 200`) is untouched by this --
+  `examples/01_validate_quadratic.py`'s decay steps (8076, 9676, 11276,
+  13238) are unchanged byte-for-byte. This only affects `half_life < 50`.
+* `test_scheduler_decays_and_resets` updated to run `norm_window_factor *
+  half_life` steps (the minimum physically required, not a guess) instead of
+  a fixed 3, and to break as soon as the scheduler fires rather than assuming
+  a fixed step count; also seeded (`torch.manual_seed(0)`) -- it wasn't
+  before, so it was flaky by construction, coincidentally never caught
+  because it also always failed before this fix.
+* `test_growing_norm_is_detected_from_norm_not_rho` adjusted: it checked a
+  linear drift 3000 steps in with a 20-step window, where the drift's
+  relative signal *within that window* has shrunk to ~0.3% (window / (2 *
+  elapsed), a real property of short windows, not a bug) -- now checks near
+  where the window first fills, where the same drift is clearly visible.
+
+51 tests (49 run without torch) -- same count as 0.3.0, no tests added or
+removed, only made to test what they claim to, and to actually run.
+
+## 0.3.0
+
+0.2.0 met a real PyTorch run and failed in three ways. All three were found by
+running it; none would have been found by reading it.
+
+### The sign of rho no longer decides whether the norm is drifting
+
+0.2.0 labelled every negative-rho step `norm_growing_fast` and told the user
+"no stationary state; add weight decay" -- including on a run that *had*
+weight decay, right after an LR decay. Reproducing it showed why that reading
+is wrong: on near-separable logistic regression with weight decay, rho was
+negative on 16,451 of 40,000 steps after an LR halving while `|w|` stayed at
+3.67 to three decimals. rho's denominator is small and noisy there; its sign
+carries no information about the norm.
+
+* Backends now pass `|w|^2`, and the verdict comes from a trend test on it:
+  the late-half vs early-half difference over `4 * half_life` steps must be
+  both significant (`norm_z`, default 1 sd) and non-negligible
+  (`norm_rel_tol`, default 0.5%). The effect-size floor is needed because at a
+  weight-decay equilibrium `|w|` barely fluctuates, so a 0.03% creep can still
+  be "significant". Measured: no weight decay -> ~1.5% per window; weight
+  decay 1e-2 -> 95th percentile 0.36%.
+* Regimes are now `norm_growing`, `norm_shrinking`, `equilibrated`,
+  `stationary_noisy` (norm flat, rho too noisy to certify), `warming_up`.
+  `norm_growing_fast` is gone.
+* `equilibrated` now also requires the norm to be flat.
+* The non-stationarity warning names both causes (no confinement vs. a moved
+  equilibrium after an LR decay or small init) instead of assuming the first.
+
+### `patience` defaulted far too short
+
+The quickstart fired an LR decay while rho was still sliding down through the
+band (1.43 -> 1.21 -> 1.08). With `patience=50` and `half_life=500`, the
+smoothed estimator physically cannot move much in 50 steps, so 50 in-band
+steps are almost automatic once rho crosses 1.1. `patience` and `min_steps`
+now default to `half_life`.
+
+### `every > 1` silently stretched every timescale 20x
+
+Config timescales count measured steps, but the monitor only measures one step
+in `every`. The benchmark ran `every=20` with a hardcoded 0.1.0-era config
+(`half_life=200, tol=0.05, patience=50, min_steps=300`): `min_steps` alone
+meant 6,000 optimiser steps -- the entire run -- so the fdr arm could never
+fire (the harness's F0 check caught this). `FDRMonitor` now treats config
+timescales as optimiser steps and converts internally (`FDRConfig.rescaled`);
+the benchmark uses library defaults and a reachable `--target-loss 0.45`.
+
+51 tests (49 run without torch).
+
 ## 0.2.0
 
 First release that survives contact with real training runs. Three things that

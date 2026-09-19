@@ -220,18 +220,28 @@ def test_scheduler_decays_and_resets():
     import physfdt.torch_backend as tb
     from physfdt import FDRConfig
 
+    torch.manual_seed(0)
     model = nn.Linear(4, 2)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
-    mon = tb.FDRMonitor(opt, FDRConfig(half_life=5, tol=1e9, patience=1, min_steps=1))
+    # tol=1e9 makes the rho-band trivial, and patience=min_steps=1 make those
+    # two gates trivial too. What actually gates the first verdict is the norm
+    # trend window: it needs norm_window_factor * half_life measured steps of
+    # history before it can say the norm is flat -- there is no way to read a
+    # trend off fewer points than that, whatever patience/min_steps say. So
+    # the loop must run at least that many steps; 3 (the original count here)
+    # was never enough regardless of how loose the other thresholds are.
+    cfg = FDRConfig(half_life=5, tol=1e9, patience=1, min_steps=1)
+    mon = tb.FDRMonitor(opt, cfg)
     sched = tb.FDREquilibriumLR(opt, mon, factor=0.5, min_lr=1e-3)
 
     x, y = torch.randn(8, 4), torch.randn(8, 2)
-    for _ in range(3):
+    for _ in range(cfg.norm_window_factor * cfg.half_life + 10):
         opt.zero_grad()
         ((model(x) - y) ** 2).mean().backward()
         with mon.measure():
             opt.step()
-        sched.step()
+        if sched.step():
+            break
 
     assert sched.n_decays >= 1
     assert opt.param_groups[0]["lr"] < 0.1
