@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+data/
+fdr_trace.csv
+benchmark_results.json
+.DS_Store

@@ -1,0 +1,45 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (core only, no torch)
+        run: |
+          python -m pip install -U pip
+          pip install -e . pytest
+
+      - name: Core import must work without torch
+        run: python -c "import physfdt; print(physfdt.__version__)"
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Doctests
+        run: pytest --doctest-modules src/physfdt/core.py src/physfdt/numpy_backend.py -q
+
+      - name: The validation example must reproduce
+        run: python examples/01_validate_quadratic.py
+
+  test-torch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with PyTorch (CPU wheel)
+        run: |
+          python -m pip install -U pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e . pytest
+      - name: Tests (real-torch paths now active)
+        run: pytest -q
