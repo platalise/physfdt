@@ -142,7 +142,7 @@ pip install "physfdt[torch]"     # + the PyTorch monitor and scheduler
 From source:
 
 ```bash
-git clone https://github.com/<you>/physfdt && cd physfdt
+git clone https://github.com/platalise/physfdt && cd physfdt
 pip install -e ".[dev]"
 pytest -q
 ```
@@ -272,7 +272,7 @@ stationary state is detected and named rather than silently mis-reported.
   title  = {physfdt: fluctuation-dissipation diagnostics for SGD},
   author = {Nguyen, Quang},
   year   = {2026},
-  url    = {https://github.com/<you>/physfdt}
+  url    = {https://github.com/platalise/physfdt}
 }
 ```
 
