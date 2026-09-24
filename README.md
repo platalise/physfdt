@@ -409,6 +409,25 @@ stationary state is detected and named rather than silently mis-reported.
 
 ## Citing
 
+If you use `X` (`physfdt.response.fd_probe`), or its validation against the
+published `X(t_w)` curve, cite the paper it implements:
+
+```bibtex
+@article{nguyen2026fdtsgd,
+  title   = {Fluctuation--dissipation violation as a spectral probe of
+             learning in stochastic gradient descent},
+  author  = {Nguyen, Quang},
+  journal = {Physical Review Letters},
+  note    = {under review},
+  year    = {2026}
+}
+```
+
+The paper's own reference code and data are archived separately on Zenodo:
+[10.5281/zenodo.21267291](https://doi.org/10.5281/zenodo.21267291).
+
+If you use the package itself (`ρ`, `FDRMonitor`, the spectral tools):
+
 ```bibtex
 @software{physfdt,
   title  = {physfdt: fluctuation-dissipation diagnostics for SGD},
