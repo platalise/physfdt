@@ -27,6 +27,7 @@ See the README for scope and limitations before using the numbers in a paper.
 
 from .core import FDRAccumulator, FDRConfig, FDRState, NonStationaryWarning
 from .numpy_backend import NumpyFDRMonitor, fdr_terms
+from .response import ResponseState, fd_probe
 from .spectral import (
     SpectralReport,
     esd,
@@ -37,7 +38,7 @@ from .spectral import (
 )
 from .trace import TraceWriter
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "FDRAccumulator",
@@ -46,6 +47,8 @@ __all__ = [
     "NonStationaryWarning",
     "NumpyFDRMonitor",
     "fdr_terms",
+    "ResponseState",
+    "fd_probe",
     "SpectralReport",
     "esd",
     "ipr",

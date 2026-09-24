@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.0
+
+New capability: a second fluctuation–dissipation observable, `X = T_eff/T_bath`,
+measured by a twin-trajectory response probe — and, unlike `ρ`, a *leading*
+indicator of generalisation.
+
+### `physfdt.response.fd_probe`
+
+Measures the full fluctuation–dissipation ratio `X = T_eff/T_bath` at a frozen
+checkpoint of any `torch.nn.Module`, by comparing the network's response to a
+small constant force against its fluctuations in the same direction. Returns a
+`ResponseState(X, T_eff, T_bath, chi, Delta, T_bath_dirs)` and restores the
+model afterwards, so it leaves an in-progress training loop undisturbed. Both
+are exported from the top level (`from physfdt import fd_probe, ResponseState`).
+
+This is an *occasional, checkpoint-time* measurement (~29 000 extra
+SGD-equivalent steps per call at the defaults), orthogonal to the per-step
+`FDRMonitor`: `ρ` is the cheap continuous signal, `X` the expensive forecast.
+
+### Why it matters
+
+On the canonical grokking test-bed (2-layer network, modular addition, MSE
+readout), `X` rises `0.12 → 0.53` and **saturates ~3–5× before held-out
+accuracy moves** — a label-free, validation-free leading indicator that a run is
+on track to generalise. `examples/05_leading_indicator.py` reproduces this and
+writes `examples/figures/leading_indicator.png`. The README section
+"Forecasting a run" describes the kill-or-continue / early-ranking use that
+saves failed runs, sweep compute, and energy — with the scope stated plainly
+(clean on quadratic/MSE losses; numerically fragile on saturating cross-entropy).
+
+### Validation
+
+`tests/test_response.py` checks the estimator against a closed-form multi-mode
+Ornstein–Uhlenbeck system with a known `X` (equilibrium and two anisotropic
+cases), to within Monte-Carlo error. Independently, the estimator reproduces the
+reference protocol of Nguyen (2026) on the exact 2-layer MSE modular-addition
+task to within 0.01 at every checkpoint.
+
 ## 0.3.1
 
 Found by the user's own `pytest -q` on macOS: two tests that were green in

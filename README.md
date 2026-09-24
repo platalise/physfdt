@@ -2,10 +2,17 @@
 
 **Fluctuation–dissipation diagnostics for stochastic gradient descent.**
 
-`physfdt` answers one question during training: *has this run equilibrated at
-the current learning rate?* It answers it from the optimiser's own arithmetic —
-no held-out validation split, no assumption about the shape of the gradient
-noise.
+`physfdt` reads two fluctuation–dissipation observables off a training run, from
+the optimiser's own arithmetic — no held-out validation split, no assumption
+about the shape of the gradient noise:
+
+- **`ρ`** — *has this run equilibrated at the current learning rate?* A cheap,
+  per-step stationarity ratio that settles at `1` when further steps at that η
+  buy nothing.
+- **`X = T_eff/T_bath`** — *is this run on track to generalise?* An occasional,
+  checkpoint-based fluctuation–dissipation ratio that, on the right loss,
+  **saturates 3–5× before held-out accuracy moves** — a label-free *leading
+  indicator* you can act on early. See [Forecasting a run](#forecasting-a-run-x-as-a-leading-indicator).
 
 ```python
 from physfdt import FDRMonitor, FDRConfig, FDREquilibriumLR
@@ -200,6 +207,123 @@ learning-rate tuning grid, with the monitor's overhead measured and subtracted.
 The script prints three pre-registered failure criteria and the numbers needed
 to check them. Read them before you read the result.
 
+## A worked example: grokking
+
+```bash
+jupyter notebook examples/04_grokking_demo.ipynb
+```
+
+Does `ρ` know when a network has actually generalized? Trained a small MLP on
+modular addition (the standard grokking benchmark) with plain SGD, watched
+`ρ` throughout. Three seeds, all consistent, and **not** what a naive
+"early-warning" framing would predict:
+
+| | pre-transition (memorized, not generalized) | post-saturation (generalized) |
+|---|---|---|
+| median ρ | 1.59 – 1.78 | 0.97 – 1.01 |
+
+`ρ` starts elevated and *relaxes down* to 1 once generalization completes —
+opposite direction from "rises before the jump" — and it settles only
+*after* test accuracy has already crossed 50% in every seed, sometimes after
+90% of the final accuracy. So it doesn't warn of a coming jump; it confirms,
+after the fact, that train accuracy saturating isn't the same thing as this
+library calling the run stationary. n=3, one `p`, one architecture — read the
+notebook's own caveats before reusing this.
+
+`ρ` is the wrong observable for *forecasting* — but there is a right one.
+
+---
+
+## Forecasting a run: `X` as a leading indicator
+
+`ρ` is a same-time ratio; it lags. The full fluctuation–dissipation ratio
+
+```
+X  =  T_eff / T_bath
+```
+
+does not. It compares the network's **response** to a small constant force
+against its **fluctuations** in the same direction — the discrete-time,
+mini-batch fluctuation–dissipation theorem. `T_bath` is the variance of the
+mini-batch gradient projected onto a probe direction (the noise driving the
+weights); `T_eff` is the temperature read off the trajectory itself, as the
+slope of the mean-squared displacement `Δ(τ)` against twice the response `χ(τ)`
+(equilibrium FDT: `Δ = 2·T·χ`). `X = 1` at equilibrium; `X` departs from 1 out
+of it.
+
+On the canonical grokking test-bed — a 2-layer network on modular addition with
+an MSE readout — **`X` saturates long before held-out accuracy moves**:
+
+![X saturates before test accuracy moves](examples/figures/leading_indicator.png)
+
+```bash
+python examples/05_leading_indicator.py       # ~5–10 min CPU, writes the figure
+```
+
+```python
+from physfdt.response import fd_probe
+
+s = fd_probe(model, X_train, y_train, loss_fn,   # loss_fn(model, xb, yb) -> loss
+             eta=0.1, weight_decay=1e-3, batch_size=64)
+print(s.X, s.T_eff, s.T_bath)                    # model is restored afterwards
+```
+
+`X` climbs from `~0.2` to a plateau of `~0.55` by `t_w ≈ 15 000`, while test
+accuracy is still at chance and does not grok until `t_w ≈ 62 000` — a lead of
+about **4×**, read from the training ramp alone with **no labels and no
+validation set**. (The estimator matches the reference `X(t_w)` curve to within
+0.01 at every checkpoint; the exact early value is Monte-Carlo-noisy, the *rise
+and early saturation* are the robust, reproducible signal.)
+
+### Why this saves trials, sweeps, and energy
+
+A hyperparameter search is mostly a graveyard of runs that were never going to
+generalise — but you don't find out until each one has burned its full
+schedule. `X` gives an earlier, label-free verdict:
+
+- **Kill-or-continue.** If `X` is climbing toward its plateau in the first
+  ~20–30 % of a run, the run is on track — keep it. If `X` is flat or stalled,
+  it is unlikely to generalise at these settings — kill it and change something,
+  rather than paying for the rest of the schedule to confirm a failure.
+- **Rank candidates early.** Across a sweep, the checkpoint at which `X`
+  saturates orders runs by how soon they will generalise, before any of them
+  has — so compute goes to the promising arms.
+- **A stopping signal that isn't the loss.** Train loss and train accuracy
+  saturate during the *memorisation* phase and say nothing about the
+  generalisation still to come; `X` keeps moving through exactly that phase.
+
+The saving is real because the probe is *occasional*: you pay for it at a
+handful of checkpoints, not every step (cost below), and in return you can stop
+paying for runs that a full validation curve would only condemn much later.
+
+### Trust, and scope
+
+The estimator is validated twice: against a closed-form multi-mode
+Ornstein–Uhlenbeck system with a known `X` (`tests/test_response.py`, to within
+Monte-Carlo error), and against the reference protocol of Nguyen (2026) on the
+exact task above — it reproduces the published `X(t_w)` curve to **within 0.01
+at every checkpoint**.
+
+`X` is clean **where the probed loss is close to quadratic** — an MSE or
+linearised readout, which is exactly the grokking construction above and the
+regime the fluctuation–dissipation theory is derived in. It is **not** a
+turn-key metric for every network:
+
+- On a strongly non-quadratic, *saturating* loss — softmax cross-entropy once
+  the network is confident — the gradient noise collapses, `T_bath → 0`, and `X`
+  becomes numerically fragile and non-monotonic. In our own cross-entropy CNN
+  runs `X` did **not** rise cleanly. Treat cross-entropy as out of scope until
+  probed on a linearised (e.g. NTK/last-layer) readout.
+- It assumes **plain SGD + weight decay** (`u = grad`, a confining term for a
+  stationary state to exist). Momentum/Adam are out of scope for the FD reading.
+- It is a **single-checkpoint, expensive** measurement (see cost below), not a
+  per-step monitor like `ρ`.
+
+Demonstrated on one task, one architecture, one modulus. The mechanism (the
+Hessian spectrum flattening across the transition pulls `X` toward 1) is
+understood, but the breadth of workloads it holds for is an open, empirical
+question — the example exists so you can run it on yours.
+
 ---
 
 ## API
@@ -211,8 +335,16 @@ to check them. Read them before you read the result.
 | `FDRMonitor(optimizer, config, mode, every)` | torch monitor; `mode="delta"` (any optimiser) or `"grad"` (plain SGD, zero extra memory). Config timescales are in **optimiser** steps whatever `every` is. |
 | `FDREquilibriumLR(optimizer, monitor, factor, min_lr)` | decay on equilibrium |
 | `NumpyFDRMonitor(config)` | toy models and hand-written optimisers |
+| `fd_probe(model, X, y, loss_fn, *, eta, weight_decay, batch_size, ...)` | twin-trajectory FD probe; returns `ResponseState(X, T_eff, T_bath, ...)`; restores the model afterwards |
 | `spectral_report(W, method="mle"\|"window")` | `α`, its standard error, R², IPR |
 | `TraceWriter(path, extra=[...])` | CSV trace, one row per measured step |
+
+**`fd_probe` cost.** One call runs about `ndir·nseed·2·M + ML` extra
+SGD-equivalent steps (defaults: `8·4·2·400 + 3000 ≈ 29 000`) and snapshots/
+restores the model, so it is an *occasional, checkpoint-time* measurement, not a
+per-step monitor. Lower `ndir`/`nseed`/`M` trade Monte-Carlo precision for speed.
+It is orthogonal to `FDRMonitor`: `ρ` is your cheap per-step signal, `X` your
+occasional forecast.
 
 **Cost.** One pass over the parameters per measured step, plus one
 parameter-sized buffer in `delta` mode. **Measured: at `every=1` the monitor took
@@ -257,11 +389,15 @@ Read this before putting a number in a paper.
 - **No claim of compute savings is made here.** Whether FDR-triggered decay beats
   a properly tuned cosine schedule is an empirical question that
   `examples/03_benchmark_arms.py` exists to settle, in either direction.
+- **`X` (the forecasting probe) has its own, narrower scope.** It is clean on
+  quadratic/MSE losses and numerically fragile on saturating cross-entropy; it
+  assumes plain SGD + weight decay; and it is demonstrated on one task. Read
+  [Forecasting a run → Trust, and scope](#trust-and-scope) before quoting an `X`.
 
 ## Tests
 
 ```bash
-pytest -q          # 51 tests (2 need torch)
+pytest -q          # 54 tests (9 need torch)
 ```
 
 The physics tests are the ones that matter. `tests/test_validation_quadratic.py`
