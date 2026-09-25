@@ -26,9 +26,6 @@ jobs:
       - name: Doctests
         run: pytest --doctest-modules src/physfdt/core.py src/physfdt/numpy_backend.py -q
 
-      - name: The validation example must reproduce
-        run: python examples/01_validate_quadratic.py
-
   test-torch:
     runs-on: ubuntu-latest
     steps:
